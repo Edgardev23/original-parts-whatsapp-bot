@@ -1,0 +1,19 @@
+# Secretos y configuración local — nunca deben subirse al repo.
+.env
+credentials/service_account.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Modelos descargados por faster-whisper (se cachean localmente)
+.cache/
+
+# Binarios de túneles (se descargan aparte, no son parte del código fuente; ver README.md)
+/ngrok
+/cloudflared
+
+# Logs locales de desarrollo
+*.log
