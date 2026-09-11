@@ -1,4 +1,4 @@
-# Original Parts — Chatbot de WhatsApp (Muestra / POC)
+#  Chatbot de WhatsApp (Muestra / POC)
 
 Backend funcional de un chatbot de WhatsApp para Original Parts (repuestos
 de motos Suzuki). Un cliente escribe o manda un audio preguntando por un
