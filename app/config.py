@@ -32,6 +32,11 @@ _REQUIRED_VARS = [
 # Valores por defecto para las variables opcionales (si no están en .env, se usan estos).
 _DEFAULT_WHISPER_MODEL_SIZE = "base"
 _DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+# Modelo de moto al que pertenece el catálogo actual (ver seed_sheet_data.md / CLAUDE.md: la muestra
+# está acotada a una sola referencia de moto). El Sheet no tiene una columna de modelo por fila, así
+# que esto le dice al LLM a qué moto aplica TODO el catálogo, para que no confirme un repuesto que
+# coincide de nombre pero es para una moto distinta a la que el cliente menciona.
+_DEFAULT_CATALOG_MOTO_MODEL = "Suzuki GN 125"
 
 
 class ConfigError(RuntimeError):
@@ -55,6 +60,7 @@ class Settings:
     google_sheet_id: str
     whisper_model_size: str
     anthropic_model: str
+    catalog_moto_model: str
 
 
 def load_settings() -> Settings:
@@ -100,6 +106,7 @@ def load_settings() -> Settings:
         # porque no es obligatorio que estén presentes en .env.
         whisper_model_size=os.getenv("WHISPER_MODEL_SIZE", _DEFAULT_WHISPER_MODEL_SIZE),
         anthropic_model=os.getenv("ANTHROPIC_MODEL", _DEFAULT_ANTHROPIC_MODEL),
+        catalog_moto_model=os.getenv("CATALOG_MOTO_MODEL", _DEFAULT_CATALOG_MOTO_MODEL),
     )
 
 
