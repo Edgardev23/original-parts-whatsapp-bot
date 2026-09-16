@@ -9,11 +9,17 @@ import tempfile  # Para crear archivos temporales de forma segura en el disco.
 import requests  # Librería HTTP usada para descargar el audio desde la URL que da Twilio.
 from fastapi import Response  # Para poder devolver una respuesta HTTP con contenido XML "a mano".
 from requests.auth import HTTPBasicAuth  # Para autenticar la descarga con usuario/contraseña (Account SID / Auth Token).
+from twilio.rest import Client as TwilioRestClient  # Cliente de la API REST de Twilio, para mensajes que el bot inicia por su cuenta.
 from twilio.twiml.messaging_response import MessagingResponse  # Helper oficial de Twilio para generar el XML (TwiML) de respuesta.
 
 from app.config import settings  # Trae las credenciales de Twilio ya validadas.
 
 logger = logging.getLogger(__name__)
+
+# Cliente REST de Twilio, creado una sola vez (igual que el cliente de Anthropic en app/llm.py).
+# Solo se usa para mensajes PROACTIVOS (ej. el reenganche tras 5 min de silencio); las respuestas
+# normales del webhook van por TwiML (`build_twiml_response`), no por este cliente.
+_rest_client = TwilioRestClient(settings.twilio_account_sid, settings.twilio_auth_token)
 
 
 class WhatsAppDownloadError(RuntimeError):
@@ -53,6 +59,22 @@ def download_audio(media_url: str, content_type: str) -> str:
         tmp_file.write(response.content)  # Escribe en disco los bytes de audio descargados.
         logger.info("Audio guardado temporalmente en: %s", tmp_file.name)
         return tmp_file.name  # Devuelve la ruta del archivo, para que transcription.py pueda abrirlo.
+
+
+def send_message(to: str, body: str) -> None:
+    """Envía un mensaje de WhatsApp por iniciativa del bot (fuera de la respuesta a un webhook).
+
+    A diferencia de `build_twiml_response`, esto SÍ hace una llamada de red a la API de Twilio
+    (Twilio no permite "empujar" un mensaje devolviendo TwiML fuera de la petición original).
+    Se usa para el mensaje de reenganche tras varios minutos sin respuesta del cliente.
+    """
+    try:
+        _rest_client.messages.create(from_=settings.twilio_whatsapp_number, to=to, body=body)
+        logger.info("Mensaje proactivo enviado a %s", to)
+    except Exception:
+        # No relanzamos: si falla, se registra y sigue el chequeo del próximo cliente (ver
+        # app/main.py:_reengagement_loop), en vez de tumbar la tarea de fondo completa.
+        logger.exception("Error enviando mensaje proactivo a %s", to)
 
 
 def build_twiml_response(message: str) -> Response:

@@ -17,8 +17,13 @@ sienta como la atención de un negocio real, no como un bot de pruebas.
 
 from __future__ import annotations  # Permite usar anotaciones de tipo modernas (p. ej. "str | None") sin problemas de compatibilidad.
 
+import asyncio  # Para correr en segundo plano el chequeo periódico de conversaciones inactivas (reenganche a los 5 min).
 import logging  # Módulo estándar de Python para registrar mensajes (info, warning, error) en la consola.
 import os  # Solo lo usamos para borrar el archivo temporal de audio una vez procesado.
+import re  # Para el chequeo simple de "¿el mensaje es solo un saludo?".
+import unicodedata  # Para quitar tildes al normalizar el texto de ese mismo chequeo.
+from contextlib import asynccontextmanager  # Para registrar la tarea de reenganche al arrancar el servidor (lifespan de FastAPI).
+from datetime import datetime, timedelta  # Para medir cuánto tiempo lleva un cliente sin responder.
 
 from fastapi import FastAPI, Request, Response
 # FastAPI: el framework que crea el servidor web.
@@ -41,7 +46,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)  # Logger propio de este archivo; en consola aparecerá como "app.main".
 
-app = FastAPI(title="Original Parts WhatsApp Bot (POC)")  # La instancia de la app: esto es lo que uvicorn arranca.
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # Arranca la tarea de reenganche (ver `_reengagement_loop`) en segundo plano junto con el
+    # servidor, y la cancela limpiamente si el servidor se apaga.
+    task = asyncio.create_task(_reengagement_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
+app = FastAPI(title="Original Parts WhatsApp Bot (POC)", lifespan=_lifespan)  # La instancia de la app: esto es lo que uvicorn arranca.
 
 # Historial de conversación por número de WhatsApp, guardado EN MEMORIA (una simple variable de
 # Python, no una base de datos): se pierde si el servidor se reinicia. Para este POC es un precio
@@ -58,10 +75,17 @@ MAX_HISTORY_MESSAGES = 12
 # Números de WhatsApp que ya recibieron el saludo de bienvenida en esta corrida del servidor.
 _greeted_senders: set[str] = set()
 
-GREETING = (
-    "¡Gracias por comunicarte con Original Parts! 🛵🔧\n"
-    "¿En qué podemos servirte?\n\n"
-)
+# Última vez que se recibió un mensaje de cada número (para detectar inactividad y reenganchar).
+_last_seen: dict[str, datetime] = {}
+# Números a los que ya se les envió el mensaje de reenganche desde su último mensaje (para no
+# reenviarlo en cada chequeo mientras sigan sin responder).
+_reengaged_senders: set[str] = set()
+
+REENGAGEMENT_DELAY = timedelta(minutes=5)  # Cuánto tiempo de silencio del cliente dispara el reenganche.
+REENGAGEMENT_CHECK_INTERVAL_SECONDS = 30  # Cada cuánto se revisa si algún cliente ya cumplió esa espera.
+
+GREETING = "¡Gracias por comunicarte con Original Parts! 🛵🔧\n¿En qué podemos servirte?"
+REENGAGEMENT_MESSAGE = "¡Hola! 👋 ¿En qué podemos servirte?"
 
 # Textos de respuesta reutilizables, para no repetir el string en varios lugares del archivo.
 MSG_REFORMULATE = (
@@ -73,6 +97,49 @@ MSG_GENERIC_ERROR = (
     "Por favor intenta de nuevo en unos minutos."
 )
 
+# Palabras sueltas que consideramos "solo un saludo" (sin tildes, en minúscula). Se usa para no
+# duplicar la pregunta "¿En qué podemos servirte?" cuando el saludo de bienvenida ya la incluye.
+_GREETING_WORDS = {
+    "hola", "hey", "ey", "buenas", "buenos", "dias", "tardes", "noches",
+    "que", "tal", "alo", "aloh", "buen", "dia", "quiubo", "qubo",
+}
+
+
+def _is_pure_greeting(text: str) -> bool:
+    """True si el mensaje son solo palabras de saludo, sin pedir nada en concreto.
+
+    P. ej. "Hola", "Buenas tardes!" o "hola que tal" son saludos puros; "hola
+    necesito una leva" no lo es, porque "leva" no está en la lista.
+    """
+    normalized = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii").lower()
+    words = re.findall(r"[a-z]+", normalized)
+    return bool(words) and all(word in _GREETING_WORDS for word in words)
+
+
+async def _reengagement_loop() -> None:
+    """Revisa periódicamente si algún cliente lleva REENGAGEMENT_DELAY sin responder.
+
+    A diferencia del resto del bot (que solo reacciona a webhooks de Twilio), este mensaje lo
+    inicia el bot por su cuenta, así que se manda por la API REST de Twilio (`whatsapp.send_message`)
+    en vez de por una respuesta TwiML.
+    """
+    while True:
+        await asyncio.sleep(REENGAGEMENT_CHECK_INTERVAL_SECONDS)
+        now = datetime.now()
+        # Se recorre una copia (list(...)) porque `_last_seen` puede cambiar mientras iteramos
+        # (un webhook nuevo puede llegar en cualquier momento).
+        for sender, last_seen in list(_last_seen.items()):
+            if sender in _reengaged_senders:
+                continue
+            if now - last_seen < REENGAGEMENT_DELAY:
+                continue
+            logger.info("%s lleva %s sin responder; enviando mensaje de reenganche.", sender, REENGAGEMENT_DELAY)
+            whatsapp.send_message(sender, REENGAGEMENT_MESSAGE)
+            _reengaged_senders.add(sender)
+            # Se guarda en el historial para que, si el cliente responde después, el modelo sepa
+            # que ese fue el último mensaje de la conversación (y no repita el saludo).
+            _conversations.setdefault(sender, []).append({"role": "assistant", "content": REENGAGEMENT_MESSAGE})
+
 
 def _reply(sender: str, message: str) -> Response:
     """Arma la respuesta TwiML final, anteponiendo el saludo de bienvenida.
@@ -83,7 +150,7 @@ def _reply(sender: str, message: str) -> Response:
     """
     if sender not in _greeted_senders:
         _greeted_senders.add(sender)
-        message = GREETING + message
+        message = f"{GREETING}\n\n{message}" if message else GREETING
     return whatsapp.build_twiml_response(message)
 
 
@@ -100,6 +167,11 @@ async def whatsapp_webhook(request: Request) -> Response:
     num_media = int(form.get("NumMedia") or 0)  # Cantidad de adjuntos que trae el mensaje (Twilio manda "0" o "1").
     media_url = form.get("MediaUrl0")  # URL del primer adjunto, si existe, para poder descargarlo.
     media_content_type = form.get("MediaContentType0") or ""  # Tipo MIME del adjunto, ej. "audio/ogg".
+
+    # Cualquier mensaje entrante reinicia el reloj de inactividad y cancela un reenganche pendiente
+    # (si el cliente ya escribió, no hace falta insistir).
+    _last_seen[sender] = datetime.now()
+    _reengaged_senders.discard(sender)
 
     # Registro de lo recibido, útil para depurar en vivo mientras haces la demo.
     logger.info(
@@ -130,6 +202,15 @@ async def whatsapp_webhook(request: Request) -> Response:
         if not user_text:
             logger.info("No se obtuvo texto utilizable (ni escrito ni transcrito).")
             return _reply(sender, MSG_REFORMULATE)
+
+        # Si es el PRIMER mensaje de este número y es solo un saludo (sin pedir nada en concreto),
+        # respondemos solo con la bienvenida (que ya incluye "¿En qué podemos servirte?") sin pasar
+        # por el LLM, para no terminar con dos preguntas parecidas seguidas. Si en cambio el cliente
+        # ya pregunta por un repuesto en este mismo primer mensaje (sin haber saludado), esta
+        # condición es falsa y sigue el flujo normal de abajo, que sí lo interpreta con el LLM.
+        if sender not in _greeted_senders and _is_pure_greeting(user_text):
+            logger.info("Primer mensaje de %s es solo un saludo; respondiendo solo con la bienvenida.", sender)
+            return _reply(sender, "")
 
         catalog = sheets.get_catalog()  # Lee en tiempo real TODAS las filas del catálogo desde Google Sheets.
         synonyms = sheets.get_synonyms()  # Lee la pestaña opcional de jerga/sinónimos (lista vacía si no existe).
